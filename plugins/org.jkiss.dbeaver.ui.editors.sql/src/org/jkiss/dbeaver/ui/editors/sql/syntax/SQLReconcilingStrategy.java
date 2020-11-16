@@ -42,7 +42,7 @@ public class SQLReconcilingStrategy implements IReconcilingStrategy, IReconcilin
 
     private static final Comparator<SQLScriptPosition> COMPARATOR = Comparator.comparingInt(SQLScriptPosition::getOffset).thenComparingInt(SQLScriptPosition::getLength);
 
-    private SortedSet<SQLScriptPosition> registeredPositions = new TreeSet<>(COMPARATOR);
+    private final NavigableSet<SQLScriptPosition> registeredPositions = new TreeSet<>(COMPARATOR);
 
     private SQLEditorBase editor;
 
@@ -65,12 +65,16 @@ public class SQLReconcilingStrategy implements IReconcilingStrategy, IReconcilin
 
     @Override
     public void reconcile(DirtyRegion dirtyRegion, IRegion subRegion) {
-        reconcile();
+        int length = 0;
+        if (DirtyRegion.INSERT.equals(dirtyRegion.getType())) {
+            length = subRegion.getLength();
+        }
+        reconcile(subRegion.getOffset(), length);
     }
 
     @Override
     public void reconcile(IRegion partition) {
-        reconcile();
+        reconcile(partition.getOffset(), partition.getLength());
     }
 
     @Override
@@ -80,36 +84,87 @@ public class SQLReconcilingStrategy implements IReconcilingStrategy, IReconcilin
 
     @Override
     public void initialReconcile() {
-        reconcile();
+        reconcile(0, document.getLength());
     }
 
-    private void reconcile() {
+    private void reconcile(int damagedRegionOffset, int damagedRegionLength) {
         if (!editor.isFoldingEnabled()) {
             return;
         }
         ProjectionAnnotationModel model = editor.getAnnotationModel();
         if (model == null) {
-            log.warn("Attempt to change folding annotations on editor with empty annotation model. editor=" + editor.toString());
+            log.debug("Attempt to change folding annotations on editor with empty annotation model. editor=" + editor);
             return;
         }
-        Iterable<SQLScriptElement> queries = getQueries();
+        SQLScriptPosition damagedRegionPosition = new SQLScriptPosition(damagedRegionOffset, damagedRegionLength, false, null);
+        SQLScriptPosition positionToTheLeft = positionToTheLeft(damagedRegionPosition);
+        SQLScriptPosition positionToTheRight = positionToTheRight(damagedRegionPosition);
+        int investigationRegionOffset = getInvestigationRegionOffset(positionToTheLeft);
+        int investigationRegionLength = getInvestigationRegionLength(positionToTheRight, investigationRegionOffset);
+        NavigableSet<SQLScriptPosition> investigationSet = getInvestigationSet(positionToTheLeft, positionToTheRight);
+        Iterable<SQLScriptElement> queries = getQueries(investigationRegionOffset, investigationRegionLength);
         Map<Annotation, Position> newAnnotations = new HashMap<>();
-        SortedSet<SQLScriptPosition> newRegisteredPositions = new TreeSet<>(COMPARATOR);
+        Collection<SQLScriptPosition> newRegisteredPositions = new ArrayList<>();
         for (SQLScriptElement element: queries) {
             if (deservesFolding(element)) {
-                SQLScriptPosition position = retrievePosition(element);
+                SQLScriptPosition position = retrievePosition(element, investigationSet);
                 newRegisteredPositions.add(position);
                 newAnnotations.put(position.getFoldingAnnotation(), position);
             }
         }
-        Annotation[] oldAnnotations = new Annotation[registeredPositions.size()];
-        int i = 0;
-        for (SQLScriptPosition position: registeredPositions) {
-            oldAnnotations[i] = position.getFoldingAnnotation();
-            i++;
-        }
+        Annotation[] oldAnnotations = collectAnnotations(investigationSet);
         model.modifyAnnotations(oldAnnotations, newAnnotations, null);
-        registeredPositions = newRegisteredPositions;
+        registeredPositions.addAll(newRegisteredPositions);
+    }
+
+    private static int getInvestigationRegionOffset(@Nullable SQLScriptPosition positionToTheLeft) {
+        if (positionToTheLeft != null) {
+            return positionToTheLeft.getOffset() + positionToTheLeft.getLength();
+        }
+        return 0;
+    }
+
+    private int getInvestigationRegionLength(@Nullable SQLScriptPosition positionToTheRight, int investigationRegionOffset) {
+        if (positionToTheRight != null && getQueries(positionToTheRight.getOffset(), positionToTheRight.getLength()).size() == 1) {
+            return positionToTheRight.getOffset() - investigationRegionOffset;
+        }
+        return document.getLength();
+    }
+
+    @Nullable
+    private SQLScriptPosition positionToTheLeft(SQLScriptPosition position) {
+        NavigableSet<SQLScriptPosition> set = registeredPositions.headSet(position, false).descendingSet();
+        for (SQLScriptPosition positionToTheLeft: set) {
+            if (positionToTheLeft.getOffset() + positionToTheLeft.getLength() <= position.getOffset()) {
+                return positionToTheLeft;
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private SQLScriptPosition positionToTheRight(SQLScriptPosition position) {
+        SortedSet<SQLScriptPosition> set = registeredPositions.tailSet(position);
+        for (SQLScriptPosition positionToTheRight: set) {
+            if (position.getOffset() + position.getLength() <= positionToTheRight.getOffset()) {
+                return positionToTheRight;
+            }
+        }
+        return null;
+    }
+
+    private NavigableSet<SQLScriptPosition> getInvestigationSet(@Nullable SQLScriptPosition positionToTheLeft,
+                                                                @Nullable SQLScriptPosition positionToTheRight) {
+        if (positionToTheLeft == null && positionToTheRight == null) {
+            return registeredPositions;
+        }
+        if (positionToTheLeft == null) {
+            return registeredPositions.headSet(positionToTheRight, false);
+        }
+        if (positionToTheRight == null) {
+            return registeredPositions.tailSet(positionToTheLeft, false);
+        }
+        return registeredPositions.subSet(positionToTheLeft, false, positionToTheRight, false);
     }
 
     private boolean deservesFolding(SQLScriptElement element) {
@@ -159,17 +214,17 @@ public class SQLReconcilingStrategy implements IReconcilingStrategy, IReconcilin
         }
     }
 
-    private Iterable<SQLScriptElement> getQueries() {
-        List<SQLScriptElement> queries = unsafeGetQueries();
+    private Collection<SQLScriptElement> getQueries(int offset, int length) {
+        List<SQLScriptElement> queries = unsafeGetQueries(offset, length);
         if (queries == null) {
             editor.reloadParserContext();
         }
-        return unsafeGetQueries();
+        return unsafeGetQueries(offset, length);
     }
 
     @Nullable
-    private List<SQLScriptElement> unsafeGetQueries() {
-        return editor.extractScriptQueries(0, document.getLength(), false, true, false);
+    private List<SQLScriptElement> unsafeGetQueries(int offset, int length) {
+        return editor.extractScriptQueries(offset, length, false, true, false);
     }
 
     private static class SQLReconcilingStrategyException extends RuntimeException {
@@ -178,17 +233,37 @@ public class SQLReconcilingStrategy implements IReconcilingStrategy, IReconcilin
         }
     }
 
-    private SQLScriptPosition retrievePosition(SQLScriptElement element) {
+    private SQLScriptPosition retrievePosition(SQLScriptElement element, NavigableSet<SQLScriptPosition> investigationSet) {
         int expandedQueryLength = expandQueryLength(element);
-        SQLScriptPosition newPosition = new SQLScriptPosition(element.getOffset(), expandedQueryLength, true, new ProjectionAnnotation());
-        SortedSet<SQLScriptPosition> registeredPositionsSubset = registeredPositions.tailSet(newPosition);
-        if (registeredPositionsSubset.isEmpty()) {
-            return newPosition;
+        SQLScriptPosition position = new SQLScriptPosition(element.getOffset(), expandedQueryLength, true, new ProjectionAnnotation());
+        SQLScriptPosition positionInSet = get(investigationSet, position);
+        if (positionInSet == null) {
+            return position;
         }
-        SQLScriptPosition firstRegisteredPosition = registeredPositionsSubset.first();
-        if (firstRegisteredPosition.equals(newPosition)) {
-            return firstRegisteredPosition;
+        return positionInSet;
+    }
+
+    @Nullable
+    private static SQLScriptPosition get(SortedSet<SQLScriptPosition> set, SQLScriptPosition position) {
+        for (SQLScriptPosition p: set) {
+            int comp = COMPARATOR.compare(position, p);
+            if (comp == 0) {
+                return position;
+            }
+            if (comp > 0) {
+                break;
+            }
         }
-        return newPosition;
+        return null;
+    }
+
+    private static Annotation[] collectAnnotations(Collection<SQLScriptPosition> collection) {
+        Annotation[] array = new Annotation[collection.size()];
+        int i = 0;
+        for (SQLScriptPosition position: collection) {
+            array[i] = position.getFoldingAnnotation();
+            i++;
+        }
+        return array;
     }
 }
